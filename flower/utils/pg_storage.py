@@ -1,5 +1,7 @@
 import json
+import queue
 import logging
+import threading
 from datetime import datetime
 from socket import error as socketerror
 
@@ -8,6 +10,8 @@ import pg8000
 logger = logging.getLogger(__name__)
 connection = None
 _connection_options = {}
+_db_insert_queue = queue.Queue()
+_db_insert_thread = None
 skip_callback = False
 
 REQ_MAX_RETRIES = 2
@@ -96,16 +100,28 @@ def _execute_query(query, args=None, rollback_on_error=True):
     return cursor
 
 
+def insert_worker():
+    while True:
+        args = _db_insert_queue.get()
+        _execute_query(_add_event, args)
+        logger.debug('Added event %s to PostGreSQL persistence store', args[1])
+
+
 def event_callback(state, event):
+    global _db_insert_thread
+
     if skip_callback or event['type'] in _ignored_events:
         return
 
-    _execute_query(_add_event, (
+    if _db_insert_thread is None:
+        _db_insert_thread = threading.Thread(target=insert_worker, daemon=True)
+        _db_insert_thread.start()
+
+    _db_insert_queue.put((
         datetime.fromtimestamp(event['timestamp']),
         event['uuid'],
         json.dumps(event)
     ))
-    logger.debug('Added event {} to PostGreSQL persistence store'.format(event['uuid']))
 
 
 def open_connection(user, password, database, host, port, use_ssl):

@@ -64,34 +64,48 @@ _ignored_events = {
 }
 
 
+def _execute_query(query, args=None, rollback_on_error=True):
+    cursor = connection.cursor()
+    for attempt in range(REQ_MAX_RETRIES):
+        try:
+            cursor.execute(query, args)
+            connection.commit()
+
+        except (socketerror, pg8000.InterfaceError):
+            logger.warning('Flower encountered a connection error with PostGreSQL database. Retrying.')
+            open_connection(**_connection_options)
+            cursor = connection.cursor()
+            continue
+
+        except Exception:
+            if rollback_on_error:
+                connection.rollback()
+            raise
+
+        finally:
+            cursor.close()
+
+        break
+
+    else:
+        logger.exception('Flower encountered a connection error with PostGreSQL database.')
+        raise RuntimeError('Unable to execute query after {} tries: {} (args={})'.format(
+            REQ_MAX_RETRIES, query, args)
+        )
+
+    return cursor
+
+
 def event_callback(state, event):
     if skip_callback or event['type'] in _ignored_events:
         return
 
-    cursor = connection.cursor()
-    for attempt in range(0, REQ_MAX_RETRIES):
-        try:
-            cursor.execute(_add_event, (
-                datetime.fromtimestamp(event['timestamp']),
-                event['uuid'],
-                json.dumps(event)
-            ))
-            connection.commit()
-            logger.debug('Added event {} to PostGreSQL persistence store'.format(event['uuid']))
-        except (socketerror, pg8000.InterfaceError):
-            if attempt < REQ_MAX_RETRIES:
-                logger.warning('Flower encountered a connection error with PostGreSQL database. Retrying.')
-                open_connection(**_connection_options)
-                cursor = connection.cursor()
-                continue
-            else:
-                logger.exception('Flower encountered a connection error with PostGreSQL database. Unable to retry.')
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            cursor.close()
-            return
+    _execute_query(_add_event, (
+        datetime.fromtimestamp(event['timestamp']),
+        event['uuid'],
+        json.dumps(event)
+    ))
+    logger.debug('Added event {} to PostGreSQL persistence store'.format(event['uuid']))
 
 
 def open_connection(user, password, database, host, port, use_ssl):
@@ -137,28 +151,15 @@ def close_connection():
 
 def get_events(max_events, max_tasks):
     logger.debug('Events loading from postgresql persistence backend')
-    cursor = connection.cursor()
-    for attempt in range(0, REQ_MAX_RETRIES):
-        try:
-            if max_events:
-                if max_events == -1:
-                    query = _get_max_events.format(max_events='ALL')
-                else:
-                    query = _get_max_events.format(max_events=max_events)
-            else:
-                query = _get_task_events.format(max_tasks=max_tasks)
-            cursor.execute(query)
-            for row in cursor:
-                yield json.loads(row[0])
-            logger.debug('{} Events loaded from postgresql persistence backend'.format(cursor.rowcount))
-        except (socketerror, pg8000.InterfaceError):
-            if attempt < REQ_MAX_RETRIES:
-                logger.warning('Flower encountered a connection error with PostGreSQL database. Retrying.')
-                open_connection(**_connection_options)
-                cursor = connection.cursor()
-                continue
-            else:
-                logger.exception('Flower encountered a connection error with PostGreSQL database. Unable to retry.')
-        finally:
-            cursor.close()
-            return
+    if max_events:
+        if max_events == -1:
+            query = _get_max_events.format(max_events='ALL')
+        else:
+            query = _get_max_events.format(max_events=max_events)
+    else:
+        query = _get_task_events.format(max_tasks=max_tasks)
+
+    cursor = _execute_query(query)
+    for row in cursor:
+        yield json.loads(row[0])
+    logger.debug('{} Events loaded from postgresql persistence backend'.format(cursor.rowcount))
